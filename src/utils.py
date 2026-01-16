@@ -12,6 +12,7 @@ class GracefulShutdown:
     
     def __init__(self):
         self.shutdown_requested = False
+        self.force_exit_requested = False
         self.shutdown_callbacks: list[Callable] = []
         
         # Register signal handlers
@@ -32,8 +33,8 @@ class GracefulShutdown:
                     print(f"Error in shutdown callback: {e}")
         else:
             # Force exit on second signal
+            self.force_exit_requested = True
             print("\n⚠️ Force exit requested.")
-            sys.exit(1)
     
     def register_callback(self, callback: Callable):
         """Register a callback to run on shutdown."""
@@ -43,3 +44,6 @@ class GracefulShutdown:
         """Check if shutdown has been requested."""
         return self.shutdown_requested
 
+    def is_force_exit_requested(self) -> bool:
+        """Check if an immediate exit has been requested."""
+        return self.force_exit_requested

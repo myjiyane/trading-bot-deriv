@@ -30,6 +30,14 @@ def get_client(settings: Settings) -> ClobClient:
     if not settings.private_key:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY is required for trading")
     
+    # In dry-run mode with placeholder keys, skip client initialization
+    is_placeholder = settings.private_key.startswith("0xREPLACE") or settings.private_key.startswith("REPLACE")
+    if settings.dry_run and is_placeholder:
+        logger.warning("⚠️  DRY-RUN MODE with placeholder API credentials")
+        logger.warning("   Trading disabled - using simulation only")
+        # Return a dummy/mock client object (None for now, handle in calling code)
+        return None
+    
     host = "https://clob.polymarket.com"
     
     # Create client with signature_type=1 for Magic/Email accounts

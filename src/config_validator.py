@@ -28,35 +28,54 @@ class ConfigValidator:
         """
         errors = []
         
-        # Required fields
-        if not settings.private_key:
-            errors.append("POLYMARKET_PRIVATE_KEY is required")
-        elif not settings.private_key.startswith("0x"):
-            errors.append("POLYMARKET_PRIVATE_KEY must start with '0x'")
-        elif len(settings.private_key) < 64:
-            errors.append("POLYMARKET_PRIVATE_KEY appears to be invalid (too short)")
-        
-        # Signature type validation
-        if settings.signature_type not in [0, 1, 2]:
-            errors.append("POLYMARKET_SIGNATURE_TYPE must be 0 (EOA), 1 (Magic.link), or 2 (Gnosis Safe)")
-        
-        # Magic.link requires funder
-        if settings.signature_type == 1 and not settings.funder:
-            errors.append("POLYMARKET_FUNDER is required when POLYMARKET_SIGNATURE_TYPE=1 (Magic.link)")
-        
+        # Deriv connection settings
+        if not settings.deriv_app_id:
+            errors.append("DERIV_APP_ID is required")
+        else:
+            if not str(settings.deriv_app_id).isdigit():
+                errors.append("DERIV_APP_ID must be numeric")
+
+        # Token required for live/demo trading; optional in dry-run mode
+        if not settings.dry_run and not settings.deriv_demo_token:
+            errors.append("DERIV_DEMO_TOKEN is required when DRY_RUN=false")
+
         # Trading parameters
-        if settings.target_pair_cost <= 0 or settings.target_pair_cost >= 1.0:
-            errors.append("TARGET_PAIR_COST must be between 0 and 1.0 (e.g., 0.99)")
-        
-        if settings.order_size < 5:
-            errors.append("ORDER_SIZE must be at least 5 (minimum on Polymarket)")
-        
-        if settings.order_type not in ["FOK", "FAK", "GTC", "GTD"]:
-            errors.append("ORDER_TYPE must be one of: FOK, FAK, GTC, GTD")
-        
+        if settings.deriv_granularity not in (60, 120, 300, 900, 1800, 3600):
+            errors.append("DERIV_GRANULARITY must be one of 60, 120, 300, 900, 1800, 3600")
+
+        if settings.deriv_stake <= 0:
+            errors.append("DERIV_STAKE must be > 0")
+
+        if settings.deriv_multiplier <= 0:
+            errors.append("DERIV_MULTIPLIER must be > 0")
+
+        if settings.deriv_trend_confirm_candles < 1:
+            errors.append("DERIV_TREND_CONFIRM_CANDLES must be >= 1")
+
+        if settings.deriv_strategy_switch_cooldown < 0:
+            errors.append("DERIV_STRATEGY_SWITCH_COOLDOWN must be >= 0")
+
+        if settings.deriv_trend_short_ma < 1 or settings.deriv_trend_long_ma < 1:
+            errors.append("DERIV_TREND_SHORT_MA and DERIV_TREND_LONG_MA must be >= 1")
+
+        if settings.deriv_trend_adx_threshold < 0:
+            errors.append("DERIV_TREND_ADX_THRESHOLD must be >= 0")
+
+        if settings.deriv_bb_period < 2:
+            errors.append("DERIV_BB_PERIOD must be >= 2")
+
+        if settings.deriv_bb_std_dev <= 0:
+            errors.append("DERIV_BB_STD_DEV must be > 0")
+
+        if settings.deriv_rsi_period < 2:
+            errors.append("DERIV_RSI_PERIOD must be >= 2")
+
+        if settings.deriv_rsi_threshold <= 0 or settings.deriv_rsi_threshold >= 100:
+            errors.append("DERIV_RSI_THRESHOLD must be between 0 and 100")
+
         if settings.cooldown_seconds < 0:
             errors.append("COOLDOWN_SECONDS must be >= 0")
-        
+
         # Balance validation
         if settings.dry_run and settings.sim_balance < 0:
             errors.append("SIM_BALANCE must be >= 0 in simulation mode")
@@ -83,4 +102,3 @@ class ConfigValidator:
             logger.error("\nPlease fix the errors in your .env file and try again.")
         
         return is_valid
-

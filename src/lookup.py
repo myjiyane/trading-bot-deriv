@@ -74,6 +74,53 @@ def parse_iso(dt: str) -> datetime | None:
         return None
 
 
+def find_current_crypto_market_slug(asset_symbol: str) -> str:
+    """
+    Find the current active 15-minute market slug for a given crypto asset.
+    
+    Searches for markets matching the pattern '<asset>-updown-15m-<timestamp>'
+    on Polymarket's crypto 15-minute page and returns the most recent/active market slug.
+    
+    Args:
+        asset_symbol: Crypto asset symbol (e.g., 'btc', 'eth', 'matic', 'sol')
+        
+    Returns:
+        The slug of the current active market for the asset
+        
+    Raises:
+        RuntimeError: If no active market found for the asset
+    """
+    asset_lower = asset_symbol.lower()
+    
+    try:
+        # Fetch Polymarket's crypto 15-minute listing page
+        page_url = "https://polymarket.com/crypto/15M"
+        resp = httpx.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        
+        # Search for the asset's market slug pattern (e.g., btc-updown-15m-1234567890)
+        pattern = rf'{asset_lower}-updown-15m-(\d+)'
+        matches = re.findall(pattern, resp.text, re.IGNORECASE)
+        
+        if not matches:
+            raise RuntimeError(f"No active 15-minute market found for {asset_symbol.upper()}")
+        
+        # Prefer the most recent timestamp that is still OPEN.
+        # 15-minute markets close 900 seconds (15 min) after the timestamp in the slug.
+        now_ts = int(datetime.now().timestamp())
+        all_ts = sorted((int(ts) for ts in matches), reverse=True)
+        open_ts = [ts for ts in all_ts if now_ts < (ts + 900)]
+        chosen_ts = open_ts[0] if open_ts else all_ts[0]
+        slug = f"{asset_lower}-updown-15m-{chosen_ts}"
+        
+        return slug
+        
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Error searching for {asset_symbol.upper()} 15-minute market: {e}")
+
+
 if __name__ == "__main__":
     import sys
 
