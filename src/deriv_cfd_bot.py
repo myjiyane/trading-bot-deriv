@@ -3,6 +3,7 @@ Deriv CFD-style trading bot for synthetic indices (e.g., Volatility 100).
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Dict, Optional, Tuple
@@ -66,6 +67,7 @@ class DerivCFDBot:
 
         self.open_contract_id = None
         self.open_direction = None
+        self.open_trade = None
         self._last_execution_ts = 0.0
         self._last_strategy_switch_ts = 0.0
         self._trend_state = None
@@ -87,6 +89,8 @@ class DerivCFDBot:
                 daily_loss_limit=settings.daily_loss_limit if settings.daily_loss_limit > 0 else None,
             )
             self.risk_manager = RiskManager(risk_limits)
+
+        self.trade_log_file = settings.trade_log_file
 
     async def connect(self) -> None:
         await self.ws.connect()
@@ -270,6 +274,12 @@ class DerivCFDBot:
         if self.settings.dry_run:
             self.open_contract_id = "SIMULATED"
             self.open_direction = direction
+            self.open_trade = {
+                "symbol": self.symbol,
+                "direction": direction,
+                "entry_price": trade_result.get("price"),
+                "entry_timestamp": datetime.utcnow().isoformat() + "Z",
+            }
             logger.info(f"🟢 DRY-RUN: Open {direction.upper()} position @ {trade_result.get('price')}")
             return
 
@@ -294,6 +304,13 @@ class DerivCFDBot:
         buy = response.get("buy", {})
         self.open_contract_id = buy.get("contract_id")
         self.open_direction = direction
+        self.open_trade = {
+            "symbol": self.symbol,
+            "direction": direction,
+            "entry_price": trade_result.get("price"),
+            "entry_timestamp": datetime.utcnow().isoformat() + "Z",
+            "contract_id": self.open_contract_id,
+        }
         logger.info(f"🟢 Opened {direction.upper()} position (contract_id={self.open_contract_id})")
 
     async def close_position(self) -> None:
@@ -301,8 +318,10 @@ class DerivCFDBot:
             return
         if self.settings.dry_run:
             logger.info("🔴 DRY-RUN: Close position")
+            self._record_trade_exit()
             self.open_contract_id = None
             self.open_direction = None
+            self.open_trade = None
             return
 
         if not self.open_contract_id:
@@ -312,8 +331,36 @@ class DerivCFDBot:
             logger.error(f"Deriv sell error: {response['error'].get('message')}")
             return
         logger.info(f"🔴 Closed position (contract_id={self.open_contract_id})")
+        self._record_trade_exit()
         self.open_contract_id = None
         self.open_direction = None
+        self.open_trade = None
+
+    def _record_trade_exit(self) -> None:
+        if not self.open_trade or not self.trade_log_file:
+            return
+        exit_price = self.price_history[-1] if self.price_history else None
+        entry_price = self.open_trade.get("entry_price")
+        pnl = None
+        pnl_pct = None
+        if entry_price and exit_price:
+            pnl = (exit_price - entry_price) * float(self.stake)
+            pnl_pct = ((exit_price / entry_price) - 1) * 100
+
+        record = {
+            **self.open_trade,
+            "exit_price": exit_price,
+            "exit_timestamp": datetime.utcnow().isoformat() + "Z",
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "stake": float(self.stake),
+        }
+
+        try:
+            with open(self.trade_log_file, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as exc:
+            logger.warning(f"Failed to write trade log: {exc}")
 
     async def run(self) -> None:
         try:
