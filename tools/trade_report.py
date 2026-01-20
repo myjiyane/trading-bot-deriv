@@ -6,7 +6,7 @@ Summarize trade logs written by the Deriv bot.
 import argparse
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
@@ -62,7 +62,8 @@ def monthly_breakdown(trades: List[Dict]) -> Dict[str, Dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trade report from Deriv bot logs")
     parser.add_argument("--log", default="trades.json", help="Path to trade log file (JSONL)")
-    parser.add_argument("--output", default="trade_report.json", help="Output report file")
+    default_output = f"reports/trade_report_{datetime.now(timezone.utc).date().isoformat()}.json"
+    parser.add_argument("--output", default=default_output, help="Output report file")
     args = parser.parse_args()
 
     log_path = Path(args.log)
@@ -72,13 +73,14 @@ def main() -> int:
 
     trades = load_trades(log_path)
     report = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "log_file": str(log_path),
         "summary": summarize(trades),
         "monthly": monthly_breakdown(trades),
     }
 
     out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2))
     print(f"Report saved to {out_path}")
     return 0
