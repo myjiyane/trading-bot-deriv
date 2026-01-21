@@ -73,6 +73,21 @@ class ConfigValidator:
         if settings.deriv_rsi_threshold <= 0 or settings.deriv_rsi_threshold >= 100:
             errors.append("DERIV_RSI_THRESHOLD must be between 0 and 100")
 
+        if settings.deriv_strategy_mode not in {"switch", "ema_scalper", "multi"}:
+            errors.append("DERIV_STRATEGY_MODE must be switch, ema_scalper, or multi")
+
+        if settings.deriv_ema_short < 1 or settings.deriv_ema_long < 1:
+            errors.append("DERIV_EMA_SHORT and DERIV_EMA_LONG must be >= 1")
+
+        if settings.deriv_ema_rsi_min < 0 or settings.deriv_ema_rsi_max > 100:
+            errors.append("DERIV_EMA_RSI_MIN must be >= 0 and DERIV_EMA_RSI_MAX <= 100")
+
+        if settings.deriv_ema_rsi_min >= settings.deriv_ema_rsi_max:
+            errors.append("DERIV_EMA_RSI_MIN must be < DERIV_EMA_RSI_MAX")
+
+        if settings.deriv_max_concurrent_trades < 1:
+            errors.append("DERIV_MAX_CONCURRENT_TRADES must be >= 1")
+
         if settings.cooldown_seconds < 0:
             errors.append("COOLDOWN_SECONDS must be >= 0")
 

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.backtester import Backtester, ParameterOptimizer, load_price_data, evaluate_performance
 from src.trend_follow_strategy import run_strategy as trend_strategy
 from src.mean_reversion_strategy import run_strategy as reversion_strategy
+from src.ema_scalper_strategy import run_strategy as ema_scalper_strategy
 from src.trend_detector import is_trending
 
 logging.basicConfig(
@@ -61,6 +62,13 @@ DEFAULT_PARAMS = {
         "rsi_threshold": 30,
         "rsi_period": 14,
     },
+    "ema_scalper": {
+        "ema_short": 12,
+        "ema_long": 26,
+        "rsi_period": 14,
+        "rsi_min": 30,
+        "rsi_max": 70,
+    },
 }
 
 # Grid search ranges for optimization
@@ -81,6 +89,12 @@ GRID_RANGES = {
         "bb_std_dev": [1.5, 2.0, 2.5],
         "rsi_threshold": [25, 30, 35],
         "adx_threshold": [25.0],
+    },
+    "ema_scalper": {
+        "ema_short": [8, 12, 16],
+        "ema_long": [20, 26, 32],
+        "rsi_min": [30, 35],
+        "rsi_max": [65, 70],
     },
 }
 
@@ -106,7 +120,12 @@ def run_strategy_backtest(
     Returns:
         Dictionary with backtest results
     """
-    strategy_fn = trend_strategy if strategy_name == "trend" else reversion_strategy
+    if strategy_name == "trend":
+        strategy_fn = trend_strategy
+    elif strategy_name == "reversion":
+        strategy_fn = reversion_strategy
+    else:
+        strategy_fn = ema_scalper_strategy
     
     trades = []
     balance = initial_balance
@@ -408,7 +427,7 @@ Examples:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["trend", "reversion", "switch"],
+        choices=["trend", "reversion", "switch", "ema_scalper"],
         default="trend",
         help="Strategy to backtest (default: trend)"
     )
@@ -570,6 +589,15 @@ Examples:
         
         if args.strategy == "switch":
             result = run_switch_backtest(
+                prices=prices,
+                timestamps=timestamps,
+                params=params,
+                initial_balance=args.initial_balance,
+                position_size=args.position_size,
+            )
+        elif args.strategy == "ema_scalper":
+            result = run_strategy_backtest(
+                strategy_name=args.strategy,
                 prices=prices,
                 timestamps=timestamps,
                 params=params,

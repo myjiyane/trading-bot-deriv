@@ -16,10 +16,24 @@ from .risk_manager import RiskLimits, RiskManager
 from .trend_detector import is_trending
 from .trend_follow_strategy import TrendFollowingPositionManager, run_trend_strategy
 from .mean_reversion_strategy import MeanReversionPositionManager, run_mean_reversion_strategy
+from .ema_scalper_strategy import EmaScalperPositionManager, run_ema_scalper
 from .utils import GracefulShutdown
 from .config_validator import ConfigValidator
 
 logger = logging.getLogger(__name__)
+
+
+class _SymbolState:
+    def __init__(self):
+        self.price_history = []
+        self.last_candle_epoch = None
+        self.history_loaded = False
+        self.trend_follow_pm = TrendFollowingPositionManager()
+        self.mean_reversion_pm = MeanReversionPositionManager()
+        self.ema_scalper_pm = EmaScalperPositionManager()
+        self.trend_state = None
+        self.trend_streak = 0
+        self.last_history_ts = None
 
 
 class DerivCFDBot:
@@ -32,7 +46,7 @@ class DerivCFDBot:
             token=settings.deriv_demo_token,
             ws_url=settings.deriv_ws_url,
         )
-        self.symbol = settings.deriv_symbol
+        self.symbols = list(settings.deriv_symbols)
         self.granularity = settings.deriv_granularity
         self.currency = settings.deriv_currency
         self.multiplier = settings.deriv_multiplier
@@ -48,11 +62,14 @@ class DerivCFDBot:
         self.bb_std_dev = settings.deriv_bb_std_dev
         self.rsi_period = settings.deriv_rsi_period
         self.rsi_threshold = settings.deriv_rsi_threshold
+        self.strategy_mode = settings.deriv_strategy_mode
+        self.ema_short = settings.deriv_ema_short
+        self.ema_long = settings.deriv_ema_long
+        self.ema_rsi_min = settings.deriv_ema_rsi_min
+        self.ema_rsi_max = settings.deriv_ema_rsi_max
 
-        self.price_history = []
+        self.symbol_states = {symbol: _SymbolState() for symbol in self.symbols}
         self.max_price_history = 200
-        self.last_candle_epoch = None
-        self._history_loaded = False
         self._shutdown_requested = False
         self._shutdown_event = asyncio.Event()
         self.current_balance = None
@@ -60,14 +77,12 @@ class DerivCFDBot:
 
         self.price_collector = MultiMarketPriceCollector(data_dir="price_history")
 
-        self.trend_follow_pm = TrendFollowingPositionManager()
-        self.mean_reversion_pm = MeanReversionPositionManager()
+        # Per-symbol PMs are stored in symbol_states.
         self.current_strategy = None
         self.enable_strategy_switching = True
 
-        self.open_contract_id = None
-        self.open_direction = None
-        self.open_trade = None
+        self.open_positions = {}
+        self.open_trades = {}
         self._last_execution_ts = 0.0
         self._last_strategy_switch_ts = 0.0
         self._trend_state = None
@@ -96,6 +111,7 @@ class DerivCFDBot:
             self.risk_manager = RiskManager(risk_limits)
 
         self.trade_log_file = settings.trade_log_file
+        self.max_concurrent_trades = settings.deriv_max_concurrent_trades
 
     async def connect(self) -> None:
         await self.ws.connect()
@@ -109,11 +125,12 @@ class DerivCFDBot:
             # Subscribe to balance updates
             await self.ws.request({"balance": 1, "subscribe": 1})
 
-        await self._subscribe_candles()
+        for symbol in self.symbols:
+            await self._subscribe_candles(symbol)
 
-    async def _subscribe_candles(self) -> None:
+    async def _subscribe_candles(self, symbol: str) -> None:
         resp = await self.ws.request({
-            "ticks_history": self.symbol,
+            "ticks_history": symbol,
             "adjust_start_time": 1,
             "count": 200,
             "end": "latest",
@@ -122,7 +139,7 @@ class DerivCFDBot:
             "granularity": self.granularity,
             "subscribe": 1,
         })
-        logger.info(f"Subscribed to candles: {self.symbol} ({self.granularity}s)")
+        logger.info(f"Subscribed to candles: {symbol} ({self.granularity}s)")
         if resp.get("error"):
             logger.warning(f"Candle subscription error: {resp['error'].get('message')}")
             return
@@ -130,7 +147,7 @@ class DerivCFDBot:
         if resp.get("msg_type") in {"candles", "ohlc"}:
             await self.handle_message(resp)
 
-    def _record_candle(self, candle: Dict) -> Tuple[bool, bool, Optional[float]]:
+    def _record_candle(self, symbol: str, candle: Dict) -> Tuple[bool, bool, Optional[float]]:
         try:
             epoch = int(candle.get("epoch") or candle.get("open_time") or 0)
             open_p = float(candle.get("open"))
@@ -140,23 +157,27 @@ class DerivCFDBot:
         except Exception:
             return False, False, None
 
+        state = self.symbol_states.get(symbol)
+        if not state:
+            return False, False, None
+
         is_closed = bool(candle.get("is_closed", False))
         new_candle = False
 
-        if self.last_candle_epoch == epoch:
-            if self.price_history:
-                self.price_history[-1] = close_p
+        if state.last_candle_epoch == epoch:
+            if state.price_history:
+                state.price_history[-1] = close_p
         else:
-            self.last_candle_epoch = epoch
-            self.price_history.append(close_p)
+            state.last_candle_epoch = epoch
+            state.price_history.append(close_p)
             new_candle = True
-            if len(self.price_history) > self.max_price_history:
-                self.price_history = self.price_history[-self.max_price_history:]
+            if len(state.price_history) > self.max_price_history:
+                state.price_history = state.price_history[-self.max_price_history:]
 
         try:
             timestamp = datetime.utcfromtimestamp(epoch).isoformat() + "Z"
             self.price_collector.add_price(
-                market_slug=self.symbol,
+                market_slug=symbol,
                 timestamp=timestamp,
                 open_price=open_p,
                 close_price=close_p,
@@ -168,10 +189,20 @@ class DerivCFDBot:
 
         return new_candle, is_closed, close_p
 
+    def _message_symbol(self, msg: Dict) -> Optional[str]:
+        if msg.get("msg_type") == "ohlc":
+            ohlc = msg.get("ohlc", {})
+            return ohlc.get("symbol")
+        echo = msg.get("echo_req", {})
+        if "ticks_history" in echo:
+            return echo.get("ticks_history")
+        return msg.get("symbol")
+
     async def handle_message(self, msg: Dict) -> None:
         if self._shutdown_requested:
             return
         self._last_message_ts = asyncio.get_event_loop().time()
+        symbol = self._message_symbol(msg)
         msg_type = msg.get("msg_type")
         if msg_type == "balance":
             balance = msg.get("balance", {}).get("balance")
@@ -180,36 +211,52 @@ class DerivCFDBot:
             return
 
         if msg_type == "candles":
-            candles = msg.get("candles", []) or []
-            if not self._history_loaded and len(candles) > 1:
-                for candle in candles:
-                    self._record_candle(candle)
-                self._history_loaded = True
-                self._last_history_ts = self._last_message_ts
-                logger.info(f"Loaded initial candle history: {len(self.price_history)} bars")
+            if not symbol:
                 return
-            self._history_loaded = True
-            self._last_history_ts = self._last_message_ts
+            candles = msg.get("candles", []) or []
+            state = self.symbol_states.get(symbol)
+            if not state:
+                return
+            if not state.history_loaded and len(candles) > 1:
+                for candle in candles:
+                    self._record_candle(symbol, candle)
+                state.history_loaded = True
+                state.last_history_ts = self._last_message_ts
+                logger.info(f"Loaded initial candle history ({symbol}): {len(state.price_history)} bars")
+                return
+            state.history_loaded = True
+            state.last_history_ts = self._last_message_ts
             for candle in candles:
-                new_candle, is_closed, _ = self._record_candle(candle)
+                new_candle, is_closed, _ = self._record_candle(symbol, candle)
                 if is_closed:
-                    await self.evaluate_strategies()
+                    logger.info(f"Candle closed {symbol}: price={self.symbol_states[symbol].price_history[-1]}")
+                    await self.evaluate_strategies(symbol)
             return
 
         if msg_type == "ohlc":
+            if not symbol:
+                return
             candle = msg.get("ohlc", {})
-            self._history_loaded = True
-            self._last_history_ts = self._last_message_ts
-            new_candle, is_closed, _ = self._record_candle(candle)
+            state = self.symbol_states.get(symbol)
+            if not state:
+                return
+            state.history_loaded = True
+            state.last_history_ts = self._last_message_ts
+            new_candle, is_closed, _ = self._record_candle(symbol, candle)
             if is_closed:
-                await self.evaluate_strategies()
+                logger.info(f"Candle closed {symbol}: price={self.symbol_states[symbol].price_history[-1]}")
+                await self.evaluate_strategies(symbol)
             return
 
-    async def evaluate_strategies(self) -> Optional[Dict]:
+    async def evaluate_strategies(self, symbol: str) -> Optional[Dict]:
         if self._shutdown_requested:
             return None
 
-        if not self.enable_strategy_switching or len(self.price_history) < 50:
+        state = self.symbol_states.get(symbol)
+        if not state:
+            return None
+
+        if not self.enable_strategy_switching or len(state.price_history) < 50:
             return None
 
         now = asyncio.get_event_loop().time()
@@ -217,9 +264,122 @@ class DerivCFDBot:
             return None
 
         current_balance = self.current_balance or self.sim_balance
-        trending = is_trending(self.price_history)
+        if self.strategy_mode == "ema_scalper":
+            trade_result = run_ema_scalper(
+                prices=state.price_history,
+                position_manager=state.ema_scalper_pm,
+                current_balance=current_balance,
+                short_period=self.ema_short,
+                long_period=self.ema_long,
+                rsi_period=self.rsi_period,
+                rsi_min=self.ema_rsi_min,
+                rsi_max=self.ema_rsi_max,
+                order_size=float(self.stake),
+            )
+            if trade_result:
+                self._last_execution_ts = now
+                await self.execute_trade(symbol, trade_result)
+            return trade_result
+
+        if self.strategy_mode == "multi":
+            if symbol not in self.open_positions and len(self.open_positions) < self.max_concurrent_trades:
+                trade_result = run_ema_scalper(
+                    prices=state.price_history,
+                    position_manager=state.ema_scalper_pm,
+                    current_balance=current_balance,
+                    short_period=self.ema_short,
+                    long_period=self.ema_long,
+                    rsi_period=self.rsi_period,
+                    rsi_min=self.ema_rsi_min,
+                    rsi_max=self.ema_rsi_max,
+                    order_size=float(self.stake),
+                )
+                if trade_result:
+                    self._last_execution_ts = now
+                    await self.execute_trade(symbol, trade_result)
+                    return trade_result
+
+                trade_result = run_mean_reversion_strategy(
+                    prices=state.price_history,
+                    position_manager=state.mean_reversion_pm,
+                    risk_manager=self.risk_manager,
+                    current_balance=current_balance,
+                    bb_period=self.bb_period,
+                    bb_std=self.bb_std_dev,
+                    rsi_period=self.rsi_period,
+                    oversold_threshold=self.rsi_threshold,
+                    order_size=float(self.stake),
+                )
+                if trade_result:
+                    self._last_execution_ts = now
+                    await self.execute_trade(symbol, trade_result)
+                    return trade_result
+
+                trade_result = run_trend_strategy(
+                    prices=state.price_history,
+                    position_manager=state.trend_follow_pm,
+                    risk_manager=self.risk_manager,
+                    current_balance=current_balance,
+                    short_period=self.trend_short_ma,
+                    long_period=self.trend_long_ma,
+                    order_size=float(self.stake),
+                )
+                if trade_result:
+                    self._last_execution_ts = now
+                    await self.execute_trade(symbol, trade_result)
+                return trade_result
+
+            # If in position, let the owning strategy manage exits only.
+            if state.ema_scalper_pm.in_position:
+                trade_result = run_ema_scalper(
+                    prices=state.price_history,
+                    position_manager=state.ema_scalper_pm,
+                    current_balance=current_balance,
+                    short_period=self.ema_short,
+                    long_period=self.ema_long,
+                    rsi_period=self.rsi_period,
+                    rsi_min=self.ema_rsi_min,
+                    rsi_max=self.ema_rsi_max,
+                    order_size=float(self.stake),
+                )
+                if trade_result:
+                    self._last_execution_ts = now
+                    await self.execute_trade(symbol, trade_result)
+                return trade_result
+            if state.trend_follow_pm.in_position:
+                trade_result = run_trend_strategy(
+                    prices=state.price_history,
+                    position_manager=state.trend_follow_pm,
+                    risk_manager=self.risk_manager,
+                    current_balance=current_balance,
+                    short_period=self.trend_short_ma,
+                    long_period=self.trend_long_ma,
+                    order_size=float(self.stake),
+                )
+                if trade_result:
+                    self._last_execution_ts = now
+                    await self.execute_trade(symbol, trade_result)
+                return trade_result
+            if state.mean_reversion_pm.in_position:
+                trade_result = run_mean_reversion_strategy(
+                    prices=state.price_history,
+                    position_manager=state.mean_reversion_pm,
+                    risk_manager=self.risk_manager,
+                    current_balance=current_balance,
+                    bb_period=self.bb_period,
+                    bb_std=self.bb_std_dev,
+                    rsi_period=self.rsi_period,
+                    oversold_threshold=self.rsi_threshold,
+                    order_size=float(self.stake),
+                )
+                if trade_result:
+                    self._last_execution_ts = now
+                    await self.execute_trade(symbol, trade_result)
+                return trade_result
+            return None
+
         trending = is_trending(
-            self.price_history,
+            state.price_history,
             short_ma_period=self.trend_short_ma,
             long_ma_period=self.trend_long_ma,
             adx_threshold=self.trend_adx_threshold,
@@ -247,8 +407,8 @@ class DerivCFDBot:
                 logger.info("📈 Switching to TREND-FOLLOWING strategy")
                 self.current_strategy = "trend"
             trade_result = run_trend_strategy(
-                prices=self.price_history,
-                position_manager=self.trend_follow_pm,
+                prices=state.price_history,
+                position_manager=state.trend_follow_pm,
                 risk_manager=self.risk_manager,
                 current_balance=current_balance,
                 short_period=self.trend_short_ma,
@@ -260,8 +420,8 @@ class DerivCFDBot:
                 logger.info("📉 Switching to MEAN-REVERSION strategy")
                 self.current_strategy = "mean_reversion"
             trade_result = run_mean_reversion_strategy(
-                prices=self.price_history,
-                position_manager=self.mean_reversion_pm,
+                prices=state.price_history,
+                position_manager=state.mean_reversion_pm,
                 risk_manager=self.risk_manager,
                 current_balance=current_balance,
                 bb_period=self.bb_period,
@@ -273,30 +433,29 @@ class DerivCFDBot:
 
         if trade_result:
             self._last_execution_ts = now
-            await self.execute_trade(trade_result)
+            await self.execute_trade(symbol, trade_result)
         return trade_result
 
-    async def execute_trade(self, trade_result: Dict) -> None:
+    async def execute_trade(self, symbol: str, trade_result: Dict) -> None:
         if self._shutdown_requested:
             return
         action = trade_result.get("action")
         if action == "entry":
-            if self.open_contract_id:
+            if symbol in self.open_positions:
                 return
-            await self.open_position(direction="long", trade_result=trade_result)
+            await self.open_position(symbol=symbol, direction="long", trade_result=trade_result)
         elif action == "exit":
-            if not self.open_contract_id:
+            if symbol not in self.open_positions:
                 return
-            await self.close_position()
+            await self.close_position(symbol=symbol)
 
-    async def open_position(self, *, direction: str, trade_result: Dict) -> None:
+    async def open_position(self, *, symbol: str, direction: str, trade_result: Dict) -> None:
         if self._shutdown_requested:
             return
         if self.settings.dry_run:
-            self.open_contract_id = "SIMULATED"
-            self.open_direction = direction
-            self.open_trade = {
-                "symbol": self.symbol,
+            self.open_positions[symbol] = "SIMULATED"
+            self.open_trades[symbol] = {
+                "symbol": symbol,
                 "direction": direction,
                 "entry_price": trade_result.get("price"),
                 "entry_timestamp": datetime.utcnow().isoformat() + "Z",
@@ -313,7 +472,7 @@ class DerivCFDBot:
                 "basis": "stake",
                 "contract_type": contract_type,
                 "currency": self.currency,
-                "symbol": self.symbol,
+                "symbol": symbol,
                 "multiplier": self.multiplier,
             },
         }
@@ -323,45 +482,46 @@ class DerivCFDBot:
             return
 
         buy = response.get("buy", {})
-        self.open_contract_id = buy.get("contract_id")
-        self.open_direction = direction
-        self.open_trade = {
-            "symbol": self.symbol,
+        contract_id = buy.get("contract_id")
+        self.open_positions[symbol] = contract_id
+        self.open_trades[symbol] = {
+            "symbol": symbol,
             "direction": direction,
             "entry_price": trade_result.get("price"),
             "entry_timestamp": datetime.utcnow().isoformat() + "Z",
-            "contract_id": self.open_contract_id,
+            "contract_id": contract_id,
         }
-        logger.info(f"🟢 Opened {direction.upper()} position (contract_id={self.open_contract_id})")
+        logger.info(f"🟢 Opened {direction.upper()} position {symbol} (contract_id={contract_id})")
 
-    async def close_position(self) -> None:
+    async def close_position(self, *, symbol: str) -> None:
         if self._shutdown_requested:
             return
         if self.settings.dry_run:
             logger.info("🔴 DRY-RUN: Close position")
-            self._record_trade_exit()
-            self.open_contract_id = None
-            self.open_direction = None
-            self.open_trade = None
+            self._record_trade_exit(symbol)
+            self.open_positions.pop(symbol, None)
+            self.open_trades.pop(symbol, None)
             return
 
-        if not self.open_contract_id:
+        contract_id = self.open_positions.get(symbol)
+        if not contract_id:
             return
-        response = await self.ws.request({"sell": self.open_contract_id, "price": 0})
+        response = await self.ws.request({"sell": contract_id, "price": 0})
         if response.get("error"):
             logger.error(f"Deriv sell error: {response['error'].get('message')}")
             return
-        logger.info(f"🔴 Closed position (contract_id={self.open_contract_id})")
-        self._record_trade_exit()
-        self.open_contract_id = None
-        self.open_direction = None
-        self.open_trade = None
+        logger.info(f"🔴 Closed position {symbol} (contract_id={contract_id})")
+        self._record_trade_exit(symbol)
+        self.open_positions.pop(symbol, None)
+        self.open_trades.pop(symbol, None)
 
-    def _record_trade_exit(self) -> None:
-        if not self.open_trade or not self.trade_log_file:
+    def _record_trade_exit(self, symbol: str) -> None:
+        open_trade = self.open_trades.get(symbol)
+        if not open_trade or not self.trade_log_file:
             return
-        exit_price = self.price_history[-1] if self.price_history else None
-        entry_price = self.open_trade.get("entry_price")
+        state = self.symbol_states.get(symbol)
+        exit_price = state.price_history[-1] if state and state.price_history else None
+        entry_price = open_trade.get("entry_price")
         pnl = None
         pnl_pct = None
         if entry_price and exit_price:
@@ -369,7 +529,7 @@ class DerivCFDBot:
             pnl_pct = ((exit_price / entry_price) - 1) * 100
 
         record = {
-            **self.open_trade,
+            **open_trade,
             "exit_price": exit_price,
             "exit_timestamp": datetime.utcnow().isoformat() + "Z",
             "pnl": pnl,
@@ -404,15 +564,19 @@ class DerivCFDBot:
                         logger.error(f"Reconnect failed: {exc}")
                         await asyncio.sleep(2.0)
                     continue
-                if self._last_history_ts is None and (now - self._last_message_ts) > 60.0:
-                    logger.warning("No candle history received yet; resubscribing...")
-                    await self._subscribe_candles()
+                for symbol, state in self.symbol_states.items():
+                    if state.last_history_ts is None and (now - self._last_message_ts) > 60.0:
+                        logger.warning(f"No candle history yet for {symbol}; resubscribing...")
+                        await self._subscribe_candles(symbol)
+                        break
                 if (now - self._last_heartbeat_ts) > self._heartbeat_interval_s:
-                    last_price = self.price_history[-1] if self.price_history else None
+                    symbol = self.symbols[0]
+                    state = self.symbol_states.get(symbol)
+                    last_price = state.price_history[-1] if state and state.price_history else None
                     last_ts = None
-                    if self.last_candle_epoch:
-                        last_ts = datetime.utcfromtimestamp(self.last_candle_epoch).isoformat() + "Z"
-                    logger.info(f"Heartbeat: last_price={last_price} last_candle={last_ts}")
+                    if state and state.last_candle_epoch:
+                        last_ts = datetime.utcfromtimestamp(state.last_candle_epoch).isoformat() + "Z"
+                    logger.info(f"Heartbeat: symbol={symbol} last_price={last_price} last_candle={last_ts} open={len(self.open_positions)}")
                     self._last_heartbeat_ts = now
 
                 msg_task = asyncio.create_task(self.ws.next_message())

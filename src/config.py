@@ -84,6 +84,12 @@ class Settings:
     deriv_demo_token: str = os.getenv("DERIV_DEMO_TOKEN", "")
     deriv_ws_url: str = os.getenv("DERIV_WS_URL", "wss://ws.deriv.com/websockets/v3")
     deriv_symbol: str = os.getenv("DERIV_SYMBOL", "R_100")
+    deriv_symbols_env: str = os.getenv("DERIV_SYMBOLS", "")
+    deriv_curr_env: str = os.getenv("DERIV_CURR", "")
+    deriv_comm_env: str = os.getenv("DERIV_COMM", "")
+    deriv_cfds_env: str = os.getenv("DERIV_CFDS", "")
+    deriv_crypto_env: str = os.getenv("DERIV_CRYPTO", "")
+    deriv_symbols: list[str] = None
     deriv_granularity: int = int(os.getenv("DERIV_GRANULARITY", "300"))  # 300=5m, 900=15m
     deriv_currency: str = os.getenv("DERIV_CURRENCY", "USD")
     deriv_multiplier: int = int(os.getenv("DERIV_MULTIPLIER", "100"))
@@ -99,9 +105,31 @@ class Settings:
     deriv_bb_std_dev: float = float(os.getenv("DERIV_BB_STD_DEV", "1.5"))
     deriv_rsi_period: int = int(os.getenv("DERIV_RSI_PERIOD", "14"))
     deriv_rsi_threshold: float = float(os.getenv("DERIV_RSI_THRESHOLD", "35"))
-    
+    deriv_strategy_mode: str = os.getenv("DERIV_STRATEGY_MODE", "switch")
+    deriv_ema_short: int = int(os.getenv("DERIV_EMA_SHORT", "12"))
+    deriv_ema_long: int = int(os.getenv("DERIV_EMA_LONG", "26"))
+    deriv_ema_rsi_min: float = float(os.getenv("DERIV_EMA_RSI_MIN", "30"))
+    deriv_ema_rsi_max: float = float(os.getenv("DERIV_EMA_RSI_MAX", "70"))
+    deriv_max_concurrent_trades: int = int(os.getenv("DERIV_MAX_CONCURRENT_TRADES", "5"))
+
     def __post_init__(self):
-        """Parse market slugs from environment variables."""
+        """Parse multi-symbol and market slug settings."""
+        # Deriv symbols
+        combined = []
+        for raw in (
+            self.deriv_symbols_env,
+            self.deriv_curr_env,
+            self.deriv_comm_env,
+            self.deriv_cfds_env,
+            self.deriv_crypto_env,
+        ):
+            combined.extend([s.strip() for s in raw.split(",") if s.strip()])
+        if combined:
+            self.deriv_symbols = combined
+        else:
+            self.deriv_symbols = [self.deriv_symbol]
+
+        # Parse market slugs from comma-separated string
         # Parse market slugs from comma-separated string
         if self._market_slugs_env:
             self.market_slugs = [s.strip() for s in self._market_slugs_env.split(",") if s.strip()]
