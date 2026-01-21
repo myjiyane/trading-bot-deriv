@@ -72,6 +72,8 @@ class DerivCFDBot:
         self._last_strategy_switch_ts = 0.0
         self._trend_state = None
         self._trend_streak = 0
+        self._last_message_ts = asyncio.get_event_loop().time()
+        self._idle_timeout_s = 300.0
 
         self.risk_manager = None
         if settings.max_daily_loss > 0 or settings.max_position_size > 0 or settings.max_trades_per_day > 0:
@@ -94,10 +96,12 @@ class DerivCFDBot:
 
     async def connect(self) -> None:
         await self.ws.connect()
+        logger.info(f"Connected to Deriv WS: {self.ws.ws_url}")
         if self.settings.deriv_demo_token:
             auth = await self.ws.authorize()
             if auth.get("error"):
                 raise RuntimeError(auth["error"].get("message", "Deriv authorization failed"))
+            logger.info("Deriv authorization OK")
 
             # Subscribe to balance updates
             await self.ws.request({"balance": 1, "subscribe": 1})
@@ -113,6 +117,7 @@ class DerivCFDBot:
             "granularity": self.granularity,
             "subscribe": 1,
         })
+        logger.info(f"Subscribed to candles: {self.symbol} ({self.granularity}s)")
 
     def _record_candle(self, candle: Dict) -> Tuple[bool, bool, Optional[float]]:
         try:
@@ -155,6 +160,7 @@ class DerivCFDBot:
     async def handle_message(self, msg: Dict) -> None:
         if self._shutdown_requested:
             return
+        self._last_message_ts = asyncio.get_event_loop().time()
         msg_type = msg.get("msg_type")
         if msg_type == "balance":
             balance = msg.get("balance", {}).get("balance")
@@ -168,6 +174,7 @@ class DerivCFDBot:
                 for candle in candles:
                     self._record_candle(candle)
                 self._history_loaded = True
+                logger.info(f"Loaded initial candle history: {len(self.price_history)} bars")
                 return
             self._history_loaded = True
             for candle in candles:
@@ -371,6 +378,19 @@ class DerivCFDBot:
 
         try:
             while not self._shutdown_requested:
+                now = asyncio.get_event_loop().time()
+                if (now - self._last_message_ts) > self._idle_timeout_s:
+                    logger.warning("No data received for 5 minutes; reconnecting...")
+                    await self.ws.close()
+                    await asyncio.sleep(1.0)
+                    try:
+                        await self.connect()
+                        self._last_message_ts = asyncio.get_event_loop().time()
+                    except Exception as exc:
+                        logger.error(f"Reconnect failed: {exc}")
+                        await asyncio.sleep(2.0)
+                    continue
+
                 msg_task = asyncio.create_task(self.ws.next_message())
                 shutdown_task = asyncio.create_task(self._shutdown_event.wait())
                 done, pending = await asyncio.wait(
