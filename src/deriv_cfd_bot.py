@@ -74,6 +74,9 @@ class DerivCFDBot:
         self._trend_streak = 0
         self._last_message_ts = asyncio.get_event_loop().time()
         self._idle_timeout_s = 300.0
+        self._last_history_ts = None
+        self._last_heartbeat_ts = self._last_message_ts
+        self._heartbeat_interval_s = 3600.0
 
         self.risk_manager = None
         if settings.max_daily_loss > 0 or settings.max_position_size > 0 or settings.max_trades_per_day > 0:
@@ -106,8 +109,10 @@ class DerivCFDBot:
             # Subscribe to balance updates
             await self.ws.request({"balance": 1, "subscribe": 1})
 
-        # Subscribe to candles
-        await self.ws.request({
+        await self._subscribe_candles()
+
+    async def _subscribe_candles(self) -> None:
+        resp = await self.ws.request({
             "ticks_history": self.symbol,
             "adjust_start_time": 1,
             "count": 200,
@@ -118,6 +123,12 @@ class DerivCFDBot:
             "subscribe": 1,
         })
         logger.info(f"Subscribed to candles: {self.symbol} ({self.granularity}s)")
+        if resp.get("error"):
+            logger.warning(f"Candle subscription error: {resp['error'].get('message')}")
+            return
+        # Initial candles often arrive in the direct response, not the stream.
+        if resp.get("msg_type") in {"candles", "ohlc"}:
+            await self.handle_message(resp)
 
     def _record_candle(self, candle: Dict) -> Tuple[bool, bool, Optional[float]]:
         try:
@@ -174,9 +185,11 @@ class DerivCFDBot:
                 for candle in candles:
                     self._record_candle(candle)
                 self._history_loaded = True
+                self._last_history_ts = self._last_message_ts
                 logger.info(f"Loaded initial candle history: {len(self.price_history)} bars")
                 return
             self._history_loaded = True
+            self._last_history_ts = self._last_message_ts
             for candle in candles:
                 new_candle, is_closed, _ = self._record_candle(candle)
                 if is_closed:
@@ -186,6 +199,7 @@ class DerivCFDBot:
         if msg_type == "ohlc":
             candle = msg.get("ohlc", {})
             self._history_loaded = True
+            self._last_history_ts = self._last_message_ts
             new_candle, is_closed, _ = self._record_candle(candle)
             if is_closed:
                 await self.evaluate_strategies()
@@ -390,6 +404,16 @@ class DerivCFDBot:
                         logger.error(f"Reconnect failed: {exc}")
                         await asyncio.sleep(2.0)
                     continue
+                if self._last_history_ts is None and (now - self._last_message_ts) > 60.0:
+                    logger.warning("No candle history received yet; resubscribing...")
+                    await self._subscribe_candles()
+                if (now - self._last_heartbeat_ts) > self._heartbeat_interval_s:
+                    last_price = self.price_history[-1] if self.price_history else None
+                    last_ts = None
+                    if self.last_candle_epoch:
+                        last_ts = datetime.utcfromtimestamp(self.last_candle_epoch).isoformat() + "Z"
+                    logger.info(f"Heartbeat: last_price={last_price} last_candle={last_ts}")
+                    self._last_heartbeat_ts = now
 
                 msg_task = asyncio.create_task(self.ws.next_message())
                 shutdown_task = asyncio.create_task(self._shutdown_event.wait())
